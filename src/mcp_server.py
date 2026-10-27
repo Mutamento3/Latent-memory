@@ -85,7 +85,7 @@ from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_fi
                               query_miss_rate, miss_rate_note, annotate_block,
                               _chunk_key, INDEX_SUMMARY_TEMPLATE,
                               INDEX_SUMMARY_EXAMPLE, INDEX_SUMMARY_FORMAT_GUIDE,
-                              has_history_intent, _file_info, _note_window, _file_chunks,
+                              has_history_intent, has_current_intent, _file_info, _note_window, _file_chunks,
                               _MARKDOWN_SIDECARS, pick_supersede_hint)
 from embedding_provider import resolve_provider
 # 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
@@ -1295,8 +1295,10 @@ class MemoryServer:
                      for r in results
                      if r["meta"].get("record_id") in self.index.supersession_log}
         else:
+            # 明确问“现在／当前”且无历史词：只给 current，不走同链多命中展开（issue #58）。
             for q in queries:
-                roots.update(self.index.matching_supersession_roots(q))
+                if not has_current_intent(q):
+                    roots.update(self.index.matching_supersession_roots(q))
         if roots:
             linked = [r for r in results
                       if (r["meta"].get("record_id") in self.index.supersession_log
@@ -3378,21 +3380,9 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
 
     corpus_only_files = corpus_files(root)  # 递归，子目录里的 md 也算
     if not corpus_only_files:
-        # 典型是指到了 src/ 或路径写岔了一格。给候选时**只看目录里有没有 md，
-        # 不看目录叫什么名字**——外层目录名本来就是自由的（叫 corpus/、我的记忆/
-        # 都一样读得到），拿名字猜就是在教人一个错的判据
-        near = [d for d in sorted(root.parent.iterdir())
-                if d.is_dir() and d != root and corpus_files(d)] if root.parent.exists() else []
-        if root.is_dir() and not near:
-            # 零素材初始化出的新库就是空目录：服务能正常起，写回后就有内容。不是故障，不报 ✗。
-            add(WARN, "语料文件", f"{root} 下还没有任何 .md 语料。没有历史材料的新库就是这样，"
-                "服务可以正常起，之后写回的记忆会落在这里；如果你本来有语料，确认一下路径。")
-            return out
-        hint = (f"同级的这些目录里有 md，你要指的多半是其中之一："
-                f"{'、'.join(d.name for d in near[:5])}。" if near
-                else "它的同级目录里也没有——确认一下记忆库到底建在哪儿。")
-        add(FAIL, "语料文件", f"{root} 下（含子目录）没找到任何 .md 语料。{hint}")
-        return out
+        # 空目录可以是合法新库；邻目录有材料不能证明这里配错，更不能跳过后续配置检查。
+        add(WARN, "语料文件", f"{root} 下还没有任何 .md 语料。没有历史材料的新库就是这样，"
+            "服务可以正常起，之后写回的记忆会落在这里；如果你本来有语料，确认一下路径。")
     add(OK, "语料目录", f"{root}（{len(corpus_only_files)} 个 md 文件）",
         files=len(corpus_only_files))
 
@@ -3433,7 +3423,7 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
             "它们会被当成记忆检索到，但不会报任何错。")
 
     index = load_corpus(roots)         # embed=False：这一档不写任何缓存文件
-    if not index.chunks:
+    if files and not index.chunks:
         # "有 md、但一块都切不出来"是上面那道 `not files` 关卡挡不住的一档：
         # 文件全是空行/只有空白的话，语料目录看着满满当当，库却是空的，
         # 服务照样起、每次检索都空手。这条要显著地说，别让它一路往下崩在除法上
@@ -3455,8 +3445,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         else:
             add(OK, "未解决来源", f"{len(referenced_records)} 个 timeline recordId 均可核对")
     lens = sorted(len(c) for c in index.chunks)
-    median_len = lens[len(lens) // 2]
-    add(OK, "建库", f"{len(index.chunks)} 块（索引层 {n_index} / 叙事层 "
+    median_len = lens[len(lens) // 2] if lens else 0
+    add(OK if lens else WARN, "建库", f"{len(index.chunks)} 块（索引层 {n_index} / 叙事层 "
                     f"{len(index.chunks) - n_index}），中位块长 {median_len} 字",
         chunks=len(index.chunks))
 
@@ -3514,7 +3504,7 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         srcs[m.get("timestamp_source")] = srcs.get(m.get("timestamp_source"), 0) + 1
     detail = "、".join(f"{k} {v} 块" for k, v in sorted(srcs.items(), key=lambda x: -x[1]))
     n_mtime = srcs.get("mtime", 0)
-    ratio = n_mtime / len(index.chunks)
+    ratio = n_mtime / len(index.chunks) if index.chunks else 0
     # 判据二（2026.08.03 补，**与比例无关**）：只要有 mtime 档的块比全库最新的
     # 真日期块还"新"，就报——**危险的恰恰是混合且占比低的情况**：绝大多数块有日期、
     # 少数几块落 mtime，那几块的时间戳就是"今天"，稳稳压过所有真日期，
@@ -3713,47 +3703,47 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
     else:
         add(OK, "工具 schema", "全部工具的 inputSchema 顶层均为 type: object，且无 anyOf/oneOf")
 
-    probe, weak_probe = _doctor_probe(index)
+    probe = _doctor_probe(index)
+    if probe is None:
+        add(WARN, "检索自查", "尚无可用的现行内容探针：可能没有活动记忆，或内容缺少区分性词面。"
+            "未执行内容检索；配置、握手与工具表已分别检查。"
+            "如有现行记忆，请另拿正文中的一句具体原话调用 latent_search。")
+        return out
     res = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                       "params": {"name": "latent_search",
                                  "arguments": {"query": probe}}})["result"]
-    level, detail = _doctor_probe_outcome(probe, weak_probe, res)
+    level, detail = _doctor_probe_outcome(probe, res)
     add(level, "检索自查", detail)
     return out
 
 
 def _doctor_probe(index):
-    """优先取含内容词的标题；只有日期／窗口标题时返回弱探针标记。"""
-    hidden = index.hidden_indices()     # 体检探针也不拿隐藏的记录当查询词
-    ranked = sorted((j for j in range(len(index.meta)) if j not in hidden),
-                    key=lambda j: index.meta[j].get("timestamp") or 0, reverse=True)
-    candidates = []
-    for i in ranked:
-        head = (index.meta[i].get("heading") or "").strip()
-        if not head:
-            head = next((ln.lstrip("# ").strip() for ln in index.chunks[i].splitlines()
-                         if ln.strip()), "")
-        if head:
-            candidates.append(head[:30])
-    for head in candidates:
-        residue = re.sub(r"\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?", " ", head)
-        residue = re.sub(r"第?\s*\d+\s*(?:窗|窗口|轮|次|段)", " ", residue)
-        residue = re.sub(r"[\s·._/|｜:：\-—年月日记录对话聊天窗口]+", "", residue)
-        if len(residue) >= 2:
-            return head, False
-    return candidates[0], True
+    """从现行可见正文选择有区分性词面的探针；标题只作兜底，无可用探针返回 None。"""
+    from memory_retrieval import tokenize
+
+    excluded = index.hidden_indices() | index.retracted | index.superseded
+    ranked = sorted((i for i, meta in enumerate(index.meta)
+                     if i not in excluded and meta.get("status", "current") == "current"),
+                    key=lambda i: index.meta[i].get("timestamp") or 0, reverse=True)
+    # 不先跑 retrieve 来筛“能成功”的查询：探针靠候选资格独立选定，真检索若坏仍须报错。
+    # 全文行不截断，避免区分性内容落在通用前缀之后时又退回通用词。
+    for use_heading in (False, True):
+        for i in ranked:
+            candidates = ([index.meta[i].get("heading") or ""] if use_heading else
+                          _chunk_body(index.chunks[i]).splitlines())
+            for candidate in candidates:
+                candidate = candidate.strip()
+                if candidate and i in index.lexical_admit(tokenize(candidate)):
+                    return candidate
+    return None
 
 
-def _doctor_probe_outcome(probe, weak_probe, result):
-    """把探针结果分级；弱探针失败只说明标题缺内容词，不冒充接线失败。"""
+def _doctor_probe_outcome(probe, result):
+    """已用词面候选资格选定的探针，真检索失败仍须报错。"""
     if not result["isError"]:
-        return OK, f"拿语料自己的标题“{probe}”查得到"
+        return OK, f"拿现行可见内容“{probe}”查得到"
     error = result["content"][0]["text"].splitlines()[0]
-    if weak_probe:
-        return (WARN, f"语料标题只有日期／窗口等通用词，只能拿“{probe}”试查；"
-                      "这类探针缺少内容词，查不到不能据此判定接线失败。"
-                      f"请另拿正文中的一句原话调用 latent_search：{error}")
-    return FAIL, f"拿语料自己的标题“{probe}”去查，反而查不到：{error}"
+    return FAIL, f"拿现行可见内容“{probe}”去查，反而查不到：{error}"
 
 
 def doctor_conclusion(checks):
@@ -5133,7 +5123,119 @@ def _selftest_no_hit_wording(now=1_800_000_000.0):
           "queryVariant 都是；库里确实没有、或常见词＋库里没有的细节时原文案不变；写前同一问法照常命中）")
 
 
+def _selftest_doctor_empty():
+    """空库不冒充故障，且不能遮掉后续真实配置错误。"""
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        corpus, index_dir, sessions = [root / name for name in ("corpus", "index", "sessions")]
+        for path in (corpus, index_dir, sessions, root / "neighbor"):
+            path.mkdir()
+        (root / "neighbor" / "2026-10-26.md").write_text("虚构邻目录材料。", encoding="utf-8")
+        tc = TimeContext("Asia/Shanghai")
+        kwargs = dict(index_dir=index_dir, threads_path=sessions / "threads.jsonl", time_context=tc)
+        before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        checks = diagnose(corpus, **kwargs)
+        assert not any(c["level"] == FAIL for c in checks), checks
+        titles = {c["title"] for c in checks}
+        assert {"写回落点", "会话线索", "MCP 接线", "工具 schema", "检索自查"} <= titles, checks
+        assert doctor_json(checks)["stats"]["files"] == 0, checks
+        assert doctor_json(checks)["stats"]["chunks"] == 0, checks
+
+        # 空库仍需发现缺失索引根、错误写回根、不能创建 thread 的父目录与损坏账本。
+        bad_index = diagnose(corpus, **dict(kwargs, index_dir=root / "missing-index"))
+        assert any(c["title"] == "索引摘要目录" and c["level"] == FAIL for c in bad_index), bad_index
+        bad_write = diagnose(corpus, **kwargs, write_dir=root / "outside")
+        assert any(c["title"] == "写回落点" and c["level"] == FAIL for c in bad_write), bad_write
+        bad_threads = diagnose(corpus, **dict(kwargs, threads_path=root / "missing" / "threads.jsonl"))
+        assert any(c["title"] == "会话线索" and c["level"] == FAIL for c in bad_threads), bad_threads
+        (corpus / ".supersessions.json").write_text("{", encoding="utf-8")
+        bad_ledger = diagnose(corpus, **kwargs)
+        assert any(c["title"] == ".supersessions.json" and c["level"] == FAIL for c in bad_ledger), bad_ledger
+        (corpus / ".supersessions.json").unlink()
+
+        # 真 CLI 的人读／JSON 输出同样成功，并检查两个读取根都没有被写入。
+        args = [sys.executable, str(Path(__file__).resolve()), "--doctor", "--corpus", str(corpus),
+                "--index-dir", str(index_dir), "--threads", str(kwargs["threads_path"]),
+                "--timezone", "Asia/Shanghai"]
+        for extra in ([], ["--json"]):
+            result = subprocess.run(args + extra, capture_output=True, text=True, encoding="utf-8")
+            assert result.returncode == 0, result.stdout + result.stderr
+            if extra:
+                report = json.loads(result.stdout)
+                assert report["status"] == WARN and report["readOnly"], report
+                assert report["stats"]["files"] == report["stats"]["chunks"] == 0, report
+            else:
+                assert "✗" not in result.stdout and "还没有任何 .md 语料" in result.stdout, result.stdout
+        after = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        assert after == before, "空库 doctor 不许创建或改写任何数据文件"
+    print("selftest doctor 空库：通过（邻目录有材料也不失败，继续配置与接线检查，CLI 只读）")
+
+
+def _selftest_doctor_current_probes():
+    """通用标题不能遮掉正文，撤回／过时／隐藏记录不能成为探针。"""
+    import memory_retrieval as retrieval
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        corpus, index_dir = root / "corpus", root / "index"
+        corpus.mkdir()
+        index_dir.mkdir()
+        bodies = ["纸月探险队的联络暗号是琥珀风铃。", "松果剧场的开演信号是银色贝壳。",
+                  "彩虹邮局的收信地点是玻璃灯塔。", "蓝莓车站的候车标记是白瓷小鹿。",
+                  "星砂花园的浇水时刻是午后钟响。", "橘云书屋的借阅凭证是铜叶书签。"]
+        for i, body in enumerate(bodies):
+            (corpus / f"record_{i}_2026-10-26.md").write_text(
+                f"## **2026.10.26** · 原文证据索引\n{body}\n", encoding="utf-8")
+        ix = load_corpus(corpus)
+        probe = _doctor_probe(ix)
+        assert probe in bodies, probe
+        before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        kwargs = dict(index_dir=index_dir, time_context=TimeContext("Asia/Shanghai"))
+        checks = diagnose(corpus, **kwargs)
+        assert any(c["title"] == "检索自查" and c["level"] == OK for c in checks), checks
+        # 真撤回、落盘、重载：不能再用已撤回内容造强探针。
+        for body in bodies:
+            ix.retract(body, "虚构验收结束", now=1_800_000_000.0)
+        ix.save_retractions(corpus / ".retractions.json")
+        retracted_snapshot = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        assert _doctor_probe(ix) is None, "所有内容撤回后应无探针"
+        retracted_checks = diagnose(corpus, **kwargs)
+        assert not any(c["level"] == FAIL for c in retracted_checks), retracted_checks
+        assert any(c["title"] == "检索自查" and c["level"] == WARN for c in retracted_checks), retracted_checks
+        assert {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()} == retracted_snapshot
+        (corpus / ".retractions.json").unlink()
+        assert {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+    ix = MemoryIndex()
+    ix.add("## 旧标题\n旧飞艇口令。", {"status": "superseded"})
+    ix.build()
+    ix.superseded.add(0)
+    assert _doctor_probe(ix) is None, "被取代的旧记录不能用来验证默认现行检索"
+
+    # 使用插件公开扩展槽检验隐藏过滤，不依赖某个部署私有插件。
+    hook = lambda index, now: {0}
+    retrieval._HIDDEN_HOOKS.append(hook)
+    try:
+        hidden_ix = MemoryIndex()
+        hidden_ix.add("## 隐藏标题\n隐藏飞艇口令。")
+        hidden_ix.build()
+        assert _doctor_probe(hidden_ix) is None, "隐藏记录不能泄露到 doctor 探针"
+    finally:
+        retrieval._HIDDEN_HOOKS.remove(hook)
+
+    common_ix = MemoryIndex()
+    for _ in range(6):
+        common_ix.add("## 原文证据索引\n相同的通用正文。")
+    common_ix.build()
+    assert _doctor_probe(common_ix) is None, "没有区分性词面时应标记探针不可用，不能冒充检索故障"
+    print("selftest doctor 内容探针：通过（通用标题改查正文，排除撤回／过时／隐藏内容，无区分性词面不误报）")
+
+
 def _selftest():
+    _selftest_doctor_current_probes()
+    _selftest_doctor_empty()
     _selftest_search_visible_body()
     _selftest_structured_text_every_tool()
     _selftest_retract_index_followers()
@@ -6167,6 +6269,16 @@ def _selftest():
                    for place in ("云港东湾", "临川南坡", "白石北岸")) \
             and same_field_text9s.count("recordId=") >= 3, \
             f"无历史意图词时，同一显式链有多个节点命中也必须突破 topN 展开整链：{same_field_text9s}"
+        # issue #58：明确问“现在／当前”且无历史词，同链多节点词面命中也只给 current
+        for q9s in ("云港东湾临川南坡白石北岸现在", "她现在住在云港东湾还是临川南坡还是白石北岸"):
+            cur_q9s = call(s9s, "latent_search", {"query": q9s, "topN": 5}, now + 24)["content"][0]["text"]
+            assert set(re.findall(r"recordId=([0-9a-f]{16})", cur_q9s)) == {newest_id9s} \
+                and "status=superseded" not in cur_q9s, \
+                f"明确问“现在”时只许返回 current 节点：{cur_q9s}"
+        both9s = call(s9s, "latent_search", {"query": "她现在住白石北岸，以前住云港东湾还是临川南坡", "topN": 2},
+                      now + 25)["content"][0]["text"]
+        assert all(place in both9s for place in ("云港东湾", "临川南坡", "白石北岸")), \
+            f"同句带历史词时历史意图优先、仍要展开整链：{both9s}"
         restarted9s = mk9s()
         assert restarted9s.index.chain_record_ids(middle_id9s) == [old_id9s, middle_id9s, newest_id9s], \
             "重启后必须从 .supersessions.json 恢复完整链"
@@ -6692,7 +6804,7 @@ def _selftest():
         assert "索引层 1" in by["建库"]["detail"], "index/ 那层要被认出来"
         assert by["时间戳来源"]["level"] == OK and "mtime" not in by["时间戳来源"]["detail"], \
             "文件名带日期 + 邻层继承，不该有块落 mtime"
-        assert by["检索自查"]["level"] == OK, "拿语料自己的标题该查得到"
+        assert by["检索自查"]["level"] == OK, "拿现行可见内容应能查得到"
         assert "没有向语料目录写入任何文件" in report
 
         # 14b.【独立索引目录·README 不冒充索引】外部 --corpus 不许被出货改写，
@@ -6767,13 +6879,11 @@ def _selftest():
         #    指错目录的三种典型都要给出**能照着改**的话，不是"失败"两个字
         gone = diagnose(_P(td) / "根本没有这个目录")
         assert gone[0]["level"] == FAIL and "--corpus" in gone[0]["detail"]
-        #    指到了旁边一个没有语料的目录（典型是 src/）：报失败之外还要**按内容**
-        #    把真正的候选找出来。这里的靶子目录叫 corpus/ 不叫 memory/，所以
-        #    谁把候选判据写成"目录名叫 memory/"，这条立刻红
+        #    空目录可能是新库；即使同级 corpus/ 有材料，也只提示核对路径，不能擅判失败。
         (_P(td) / "src").mkdir()
         astray = diagnose(_P(td) / "src")
-        assert astray[-1]["level"] == FAIL and "corpus" in astray[-1]["detail"], \
-            f"该按内容指出“你要指的多半是 corpus/”：{astray[-1]}"
+        assert not any(c["level"] == FAIL for c in astray), astray
+        assert any(c["title"] == "语料文件" and c["level"] == WARN for c in astray), astray
         #    指到了产出目录本身：人格文件被当成记忆吃进库，不报任何错——这条只能靠体检
         (corpus / "CLAUDE.md").write_text("# 人格文件\n你是……\n", encoding="utf-8")
         stray = {c["title"]: c for c in diagnose(corpus)}
@@ -6813,7 +6923,7 @@ def _selftest():
     #     所以这一项起真进程、传相对值、断言 stdout 与退出码。
     #     **断的是 str(corpus.resolve()) 在不在输出里，不是字符串 "corpus" 在不在**
     #     ——后者用户本来就知道，回显给他等于一个字没答。
-    #     变异：去掉 diagnose 里的 .resolve() / 把块数写死 / 空目录也报成功 → 各自红
+    #     变异：去掉 diagnose 里的 .resolve() / 把块数写死 / 空库跳过接线检查 → 各自红
     import subprocess
     here = _P(__file__).resolve().parent
 
@@ -6852,29 +6962,24 @@ def _selftest():
             encoding="utf-8")
         code2, out2 = run_doctor(td, "--corpus", "另一份")
         assert code2 == 0 and "建库：3 块" in out2, f"块数要真数出来，不是写死的：{out2}"
-        #    最新标题只有日期时，必须继续找较旧但有内容词的标题，不能拿日期冒充探针。
+        #    正文优先，不再用标题长得像内容词来判断探针强弱。
         probe_index = MemoryIndex()
         probe_index.add("## 修咖啡机\n换掉保险丝。",
                         {"heading": "修咖啡机", "timestamp": 1})
         probe_index.add("## 2026-08-29 记\n那天整理了房间。",
                         {"heading": "2026-08-29 记", "timestamp": 2})
         probe_index.build()
-        assert _doctor_probe(probe_index) == ("修咖啡机", False), \
-            "doctor 应优先挑含内容词的标题，不按最新时间盲取纯日期标题"
+        assert _doctor_probe(probe_index) == "那天整理了房间。", \
+            "doctor 应从最新可见正文中选择有区分性词面的探针"
         date_probe_index = MemoryIndex()
         date_probe_index.add("## 2026-08-29 记\n那天整理了房间。",
                              {"heading": "2026-08-29 记", "timestamp": 2})
         date_probe_index.build()
-        assert _doctor_probe(date_probe_index) == ("2026-08-29 记", True), \
-            "只有纯日期标题时必须标成弱探针，供失败结果降级 WARN"
+        assert _doctor_probe(date_probe_index) == "那天整理了房间。", \
+            "标题只有日期时仍应优先用具体正文，不能把有内容的记录当弱探针"
         failed_probe = {"isError": True, "content": [{"text": "没有可靠命中\n请换个问法"}]}
-        weak_level, weak_detail = _doctor_probe_outcome(
-            "2026-08-29 记", True, failed_probe)
-        assert weak_level == WARN and "标题只有日期／窗口等通用词" in weak_detail \
-            and "正文中的一句原话" in weak_detail, \
-            f"纯日期弱探针失败必须降级 WARN 并给人工复查出口：{weak_detail}"
         strong_level, strong_detail = _doctor_probe_outcome(
-            "修咖啡机", False, failed_probe)
+            "修咖啡机", failed_probe)
         assert strong_level == FAIL and "反而查不到" in strong_detail, \
             "含内容词的强探针失败仍必须判 FAIL"
         assert "时间范围" in out and "2026-06-17" in out, \
@@ -6921,13 +7026,13 @@ def _selftest():
         assert _snapshot(corpus) == before_main and _snapshot(facts_dir.parent) == before_facts, \
             "--json 体检同样只读，事实库也不许被动"
 
-        #    空目录：显著提示 + 退出码非零（自动化靠它，人靠那句话）
+        #    空目录：显著提示尚无材料，邻目录是否有语料不改变这个结论。
         empty = _P(td) / "空目录"
         empty.mkdir()
         code, out = run_doctor(td, "--corpus", "空目录")
-        assert code != 0, f"空目录必须非零退出，实际 {code}：{out}"
-        assert "✗" in out and "没找到任何 .md 语料" in out, f"提示要显著：{out}"
-        assert str(empty.resolve()) in out, "失败路径同样要回答“读的是哪儿”"
+        assert code == 0, f"合法空目录不应判故障，实际 {code}：{out}"
+        assert "✗" not in out and "还没有任何 .md 语料" in out and "MCP 接线" in out, f"提示要显著且继续检查：{out}"
+        assert str(empty.resolve()) in out, "空库路径同样要回答“读的是哪儿”"
         #    零素材新库：空目录、旁边也没有语料 → ⚠ 不是 ✗，退出码 0（服务本来就能起）
         with tempfile.TemporaryDirectory() as fresh_td:
             (_P(fresh_td) / "新库").mkdir()

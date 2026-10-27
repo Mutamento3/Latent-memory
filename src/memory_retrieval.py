@@ -195,6 +195,15 @@ def has_history_intent(query):
     return isinstance(query, str) and any(term in query for term in HISTORY_INTENT_TERMS)
 
 
+# 明确问“当前状态”的词（issue #58）。只在没有历史意图时生效：此时不走“同链多节点命中
+# 展开整链”的例外，只返回 current；同句既有当前词又有历史词，历史意图优先。
+CURRENT_INTENT_TERMS = ("现在", "目前", "当前", "如今", "眼下", "最新")
+
+
+def has_current_intent(query):
+    return isinstance(query, str) and any(term in query for term in CURRENT_INTENT_TERMS)
+
+
 # 查询向量对全库逐块点积：纯 Python 生成器在约 1600 块×1024 维上约 260ms，是被动召回
 # 延迟的最大一段；3.12+ 的 math.sumprod 在 C 里算，旧解释器退回原写法。
 _dot = getattr(math, "sumprod", None) or (lambda a, b: sum(x * y for x, y in zip(a, b)))
