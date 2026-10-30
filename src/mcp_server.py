@@ -2675,6 +2675,12 @@ def _make_deny_logger():
     lock = threading.Lock()
     st = {"t0": None, "n": 0, "dropped": 0, "timer": None}
 
+    def _write(line):
+        # 使用进程所在系统的带偏移时间，便于与客户端日志对齐；不跟随语料业务时区。
+        # 逐条拒绝与两种溢出摘要共用出口，保留原行首供已有日志筛选使用。
+        stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        print(f"{line} [time={stamp} pid={os.getpid()}]", file=sys.stderr)
+
     def _settle_locked():
         """窗口翻页：清计数，返回要补打的那行（没压掉东西就 None）。调用方持锁。"""
         if st["timer"] is not None:
@@ -2688,7 +2694,7 @@ def _make_deny_logger():
         with lock:
             line = _settle_locked()
         if line:
-            print(line, file=sys.stderr)
+            _write(line)
 
     def emit(line):
         out = []
@@ -2711,7 +2717,7 @@ def _make_deny_logger():
                     st["timer"] = t
                     t.start()
         for x in out:
-            print(x, file=sys.stderr)
+            _write(x)
 
     return emit
 
@@ -2934,8 +2940,9 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
         def _log_deny(self, code, msg, note=None):
             """被拒的请求在 stderr 上留一行（八条拒绝全走 `_deny`，所以落点只有这一处）。
 
-            形如：`被拒 404 GET /nope 来自 127.0.0.1：没有这个端点`
-            ——状态码、方法、**剥掉 query 的**路径、客户端 IP、原因短语。
+            行首形如：`被拒 404 GET /nope 来自 127.0.0.1：没有这个端点`。
+            状态码、方法、**剥掉 query 的**路径、客户端 IP、原因短语；
+            `_make_deny_logger` 统一在行尾补带时区时间和 PID，限流摘要也带。
 
             `note` 是**调用点写死的一句常量补注**，原样缀在行尾（不过原因短语那道
             截断）。⚠ **只许传常量，永远不许把客户端来的值塞进 `note`**——下面
@@ -8710,7 +8717,7 @@ if __name__ == "__main__":
             srv.start_background_load(on_error=_background_load_failed)
             print("索引在后台建：握手已经可用，建好之前工具调用会回“索引还在建”。", file=sys.stderr)
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
-                  f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
+                  f"（鉴权：{'Bearer token' if (token or hook_token) else '无——仅限回环+外层反代'}；"
                   f"隐藏入口：{hidden_note}；"
                   f"{'页面口子：开（/admin/api）；' if admin else ''}"
                   f"{'静态页：/hut/；' if args.ui else ''}"
